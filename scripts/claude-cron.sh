@@ -26,7 +26,7 @@ fi
 
 python3 - "$JOBS_FILE" "$RUNTIME_FILE" "$PROMPTS_FILE" "$LOG_DIR" "$LOCK_DIR" "$BASE_DIR" << 'PYTHON'
 import json, sys, os, subprocess
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 jobs_file = sys.argv[1]
@@ -91,6 +91,20 @@ for job in jobs_data.get("jobs", []):
     if not prompt:
         continue
 
+    # Get model from jobs.json payload (e.g. "anthropic/claude-opus-4-6" → "opus")
+    payload = job.get("payload", {})
+    job_model = payload.get("model", "")
+    # Convert openclaw model format to claude CLI format
+    cli_model = ""
+    if job_model:
+        # "anthropic/claude-opus-4-6" → "opus"
+        # "anthropic/claude-sonnet-4-6" → "sonnet"
+        # "anthropic/claude-haiku-4-5" → "haiku"
+        parts = job_model.split("/")[-1]  # "claude-opus-4-6"
+        if "opus" in parts: cli_model = "opus"
+        elif "sonnet" in parts: cli_model = "sonnet"
+        elif "haiku" in parts: cli_model = "haiku"
+
     lock_file = os.path.join(lock_dir, f"{name}.lock")
 
     # Skip if already running
@@ -111,8 +125,11 @@ for job in jobs_data.get("jobs", []):
     try:
         log_file = os.path.join(log_dir, f"{name}-{now.strftime('%Y%m%d-%H%M')}.log")
 
+        cmd = ["claude", "-p", prompt, "--allowedTools", "Read,Write,Bash", "--dangerously-skip-permissions", "--max-turns", "20", "--output-format", "json"]
+        if cli_model:
+            cmd.extend(["--model", cli_model])
         result = subprocess.run(
-            ["claude", "-p", prompt, "--allowedTools", "Read,Write,Bash", "--dangerously-skip-permissions", "--max-turns", "20", "--output-format", "json"],
+            cmd,
             capture_output=True,
             text=True,
             timeout=300,
@@ -128,9 +145,10 @@ for job in jobs_data.get("jobs", []):
             output = jout.get("result", result.stdout)
             model_usage = jout.get("modelUsage", {})
             if model_usage:
-                model_name = list(model_usage.keys())[0]
-                first = list(model_usage.values())[0]
-                cost_usd = first.get("costUSD", 0)
+                # Pick the model with highest cost (= the one that did real work)
+                best = max(model_usage.items(), key=lambda x: x[1].get("costUSD", 0))
+                model_name = best[0]
+                cost_usd = sum(v.get("costUSD", 0) for v in model_usage.values())
             if jout.get("is_error"):
                 output = jout.get("result", "error")
         except:
@@ -158,16 +176,19 @@ for job in jobs_data.get("jobs", []):
             state["consecutiveErrors"] = state.get("consecutiveErrors", 0) + 1
         job["state"] = state
 
-        # Update model field in queue posts created by this run
-        if model_name and status == "ok" and "generate" in name:
+        # Update model + timestamp in queue posts created by this run
+        if status == "ok" and "generate" in name:
             queue_file = os.path.join(base_dir, "data", "blog-queue.json" if "blog" in name else "queue.json")
+            run_ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
             try:
                 with open(queue_file) as qf:
                     qdata = json.load(qf)
                 changed = False
                 for p in qdata.get("posts", []):
-                    if p.get("model") in ("claude-cli", "", None) and p.get("status") == "draft":
-                        p["model"] = model_name
+                    if p.get("status") == "draft" and (not p.get("model") or p.get("model") in ("claude-cli", "")):
+                        if model_name:
+                            p["model"] = model_name
+                        p["generatedAt"] = run_ts
                         changed = True
                 if changed:
                     with open(queue_file, "w") as qf:
